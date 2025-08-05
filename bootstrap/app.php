@@ -2,6 +2,7 @@
 
 use App\Http\Middleware\HandleAppearance;
 use App\Http\Middleware\HandleInertiaRequests;
+use App\Http\Middleware\VerifyShopify;
 use Illuminate\Foundation\Application;
 use Illuminate\Foundation\Configuration\Exceptions;
 use Illuminate\Foundation\Configuration\Middleware;
@@ -20,6 +21,18 @@ return Application::configure(basePath: dirname(__DIR__))
             HandleAppearance::class,
             HandleInertiaRequests::class,
             AddLinkHeadersForPreloadedAssets::class,
+        ]);
+        
+        // Shopify middleware alias'ı ekle
+        $middleware->alias([
+            'verify.shopify' => VerifyShopify::class,
+        ]);
+        
+        // CSRF korumasını API route'ları için devre dışı bırak
+        $middleware->validateCsrfTokens(except: [
+            '/api/sync/products',
+            '/api/sync/status',
+            '/api/shopify/products'
         ]);
     })
     ->withExceptions(function (Exceptions $exceptions) {
