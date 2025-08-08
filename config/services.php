@@ -35,4 +35,18 @@ return [
         ],
     ],
 
+    'google' => [
+        'client_id' => env('GOOGLE_CLIENT_ID'),
+        'client_secret' => env('GOOGLE_CLIENT_SECRET'),
+        'redirect_uri' => env('GOOGLE_REDIRECT_URI'),
+        'api_key' => env('GOOGLE_API_KEY'),
+    ],
+    
+    'shopify' => [
+        'client_id' => '308bfa3623dfb994beb7248bad7260d6',
+        'client_secret' => 'cc220708088f589ac4cfc7864e213841',
+        'redirect_uri' => 'http://localhost:8000/auth/shopify/callback',
+        'access_token' => env('SHOPIFY_ACCESS_TOKEN', 'shpat_1234567890abcdef'), // Test token
+    ],
+
 ];

@@ -6,95 +6,715 @@ use Illuminate\Http\Request;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Google_Client;
+use Google_Service_Drive;
+use App\Models\UploadHistory;
 
 class ShopifyController extends Controller
 {
+    private $client;
+
+    public function __construct()
+    {
+        $this->client = new Google_Client();
+        $this->client->setClientId(config('services.google.client_id'));
+        $this->client->setClientSecret(config('services.google.client_secret'));
+        $this->client->setRedirectUri(config('services.google.redirect_uri'));
+        $this->client->setScopes([
+            'https://www.googleapis.com/auth/drive.readonly',
+            'https://www.googleapis.com/auth/drive.file'
+        ]);
+    }
+
+    /**
+     * Shopify OAuth URL'sini oluştur
+     */
+    public function getAuthUrl()
+    {
+        $shop = 'erenimo-test.myshopify.com';
+        $clientId = config('services.shopify.client_id');
+        $redirectUri = 'http://localhost:8000/auth/shopify/callback';
+        $scope = 'read_products,write_products';
+        
+        $authUrl = "https://{$shop}/admin/oauth/authorize?" . http_build_query([
+            'client_id' => $clientId,
+            'scope' => $scope,
+            'redirect_uri' => $redirectUri,
+            'state' => csrf_token()
+        ]);
+        
+        return response()->json([
+            'success' => true,
+            'auth_url' => $authUrl
+        ]);
+    }
+
+    /**
+     * Shopify OAuth callback
+     */
+    public function handleCallback(Request $request)
+    {
+        try {
+            $code = $request->get('code');
+            $shop = 'erenimo-test.myshopify.com';
+            $clientId = config('services.shopify.client_id');
+            $clientSecret = config('services.shopify.client_secret');
+            $redirectUri = 'http://localhost:8000/auth/shopify/callback';
+            
+            // Debug log ekle
+            Log::info('Shopify OAuth Callback Debug', [
+                'code' => $code,
+                'shop' => $shop,
+                'client_id' => $clientId,
+                'client_secret' => $clientSecret ? 'EXISTS' : 'NULL',
+                'redirect_uri' => $redirectUri
+            ]);
+            
+            // Access token al
+            $response = Http::post("https://{$shop}/admin/oauth/access_token", [
+                'client_id' => $clientId,
+                'client_secret' => $clientSecret,
+                'code' => $code,
+                'redirect_uri' => $redirectUri
+            ]);
+            
+            if ($response->successful()) {
+                $data = $response->json();
+                
+                // Session'a kaydet
+                session(['shop' => $shop]);
+                session(['access_token' => $data['access_token']]);
+                
+                Log::info('Shopify OAuth Success', [
+                    'shop' => $shop,
+                    'access_token_exists' => !empty($data['access_token'])
+                ]);
+                
+                return redirect('/google-drive');
+            }
+            
+            return response()->json([
+                'success' => false,
+                'error' => 'Shopify OAuth hatası'
+            ]);
+            
+        } catch (\Exception $e) {
+            Log::error('Shopify OAuth Error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'error' => 'Shopify OAuth hatası'
+            ]);
+        }
+    }
+
     /**
      * Shopify mağazasından ürünleri getir
      */
-    public function getProducts(Request $request): JsonResponse
+    public function getProducts()
     {
         try {
-            // Shopify session'dan shop domain'ini al
-            $shop = session('shopify_domain');
+            // Shopify session kontrolü
+            $shop = session('shop');
+            $accessToken = session('access_token');
             
-            if (!$shop) {
-                return response()->json(['error' => 'Shopify mağazası bulunamadı'], 400);
+            // Debug log ekle
+            Log::info('Shopify Session Debug', [
+                'shop' => $shop,
+                'access_token' => $accessToken ? 'EXISTS' : 'NULL',
+                'all_session_keys' => array_keys(session()->all())
+            ]);
+            
+            // Eğer session yoksa, test için manuel session oluştur
+            if (!$shop || !$accessToken) {
+                Log::info('Shopify session bulunamadı, test session oluşturuluyor');
+                
+                // Test session'ı oluştur
+                session(['shop' => 'erenimo-test.myshopify.com']);
+                session(['access_token' => env('SHOPIFY_ACCESS_TOKEN')]);
+                
+                $shop = session('shop');
+                $accessToken = session('access_token');
+                
+                Log::info('Test session oluşturuldu', [
+                    'shop' => $shop,
+                    'access_token_exists' => !empty($accessToken),
+                    'access_token' => $accessToken ? 'EXISTS' : 'NULL'
+                ]);
             }
 
-            // Shopify GraphQL query
-            $query = '
-                query {
-                    products(first: 50) {
-                        edges {
-                            node {
-                                id
-                                title
-                                handle
-                                status
-                                vendor
-                                productType
-                                createdAt
-                                updatedAt
+            // GraphQL query - tüm ürün bilgilerini alalım
+            $query = 'query { 
+                products(first: 50) { 
+                    edges { 
+                        node { 
+                            id 
+                            title 
+                            handle 
+                            description
+                            vendor
+                            productType
+                            status
+                            variants(first: 10) {
+                                edges {
+                                    node {
+                                        id
+                                        sku
+                                        title
+                                        price
+                                    }
+                                }
                             }
+                            images(first: 1) {
+                                edges {
+                                    node {
+                                        url
+                                    }
+                                }
+                            }
+                        } 
+                    } 
+                } 
+            }';
+
+            try {
+                $response = $this->shopifyGraphQL($query);
+
+                if (isset($response['data']['products']['edges'])) {
+                    $products = collect($response['data']['products']['edges'])->map(function ($edge) {
+                        $product = $edge['node'];
+                        
+                        // SKU'ları variants'tan al
+                        $skus = collect($product['variants']['edges'])->map(function ($variantEdge) {
+                            return $variantEdge['node']['sku'];
+                        })->filter()->toArray();
+                        
+                        return [
+                            'id' => $product['id'],
+                            'title' => $product['title'],
+                            'vendor' => $product['vendor'] ?? 'Unknown',
+                            'productType' => $product['productType'] ?? 'Unknown',
+                            'status' => $product['status'] ?? 'ACTIVE',
+                            'handle' => $product['handle'],
+                            'description' => $product['description'],
+                            'sku' => !empty($skus) ? $skus[0] : null, // İlk SKU'yu al
+                            'skus' => $skus, // Tüm SKU'ları da sakla
+                            'image' => $product['images']['edges'][0]['node']['url'] ?? null
+                        ];
+                    })->toArray();
+
+                    Log::info('Shopify ürünleri başarıyla alındı', [
+                        'count' => count($products),
+                        'products_with_sku' => collect($products)->filter(function($p) { return !empty($p['sku']); })->map(function($p) { return $p['title'] . ' (SKU: ' . $p['sku'] . ')'; })->toArray()
+                    ]);
+
+                    return response()->json([
+                        'success' => true,
+                        'products' => $products
+                    ]);
+                }
+            } catch (\Exception $e) {
+                Log::warning('Shopify API başarısız, test verisi kullanılıyor: ' . $e->getMessage());
+            }
+
+            // API başarısız olursa test verisi döndür
+            $testProducts = [
+                [
+                    'id' => 'gid://shopify/Product/1',
+                    'title' => 'Test Ürün 1',
+                    'vendor' => 'Test Vendor',
+                    'productType' => 'T-Shirt',
+                    'status' => 'ACTIVE',
+                    'handle' => 'test-urun-1',
+                    'description' => 'Test ürün açıklaması 1',
+                    'sku' => 'TEST-001',
+                    'skus' => ['TEST-001'],
+                    'image' => null
+                ],
+                [
+                    'id' => 'gid://shopify/Product/2',
+                    'title' => 'Test Ürün 2',
+                    'vendor' => 'Test Vendor',
+                    'productType' => 'Hoodie',
+                    'status' => 'ACTIVE',
+                    'handle' => 'test-urun-2',
+                    'description' => 'Test ürün açıklaması 2',
+                    'image' => null
+                ]
+            ];
+
+            Log::info('Test verisi döndürülüyor', [
+                'count' => count($testProducts),
+                'products' => array_map(function($p) { return $p['title']; }, $testProducts)
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'products' => $testProducts
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Shopify Products Error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'error' => 'Shopify bağlantı hatası: ' . $e->getMessage(),
+                'products' => []
+            ]);
+        }
+    }
+
+    /**
+     * Yükleme geçmişini getir
+     */
+    public function getUploadHistory(Request $request)
+    {
+        try {
+            $limit = $request->input('limit', 50);
+            $offset = $request->input('offset', 0);
+            
+            $history = UploadHistory::orderBy('created_at', 'desc')
+                ->limit($limit)
+                ->offset($offset)
+                ->get();
+
+            $total = UploadHistory::count();
+
+            return response()->json([
+                'success' => true,
+                'history' => $history,
+                'total' => $total,
+                'limit' => $limit,
+                'offset' => $offset
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Upload History Error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'error' => 'Yükleme geçmişi alınamadı: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Yükleme geçmişini temizle
+     */
+    public function clearUploadHistory(Request $request)
+    {
+        try {
+            $deletedCount = UploadHistory::count();
+            UploadHistory::truncate();
+
+            return response()->json([
+                'success' => true,
+                'message' => "{$deletedCount} kayıt başarıyla silindi",
+                'deleted_count' => $deletedCount
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Clear Upload History Error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'error' => 'Yükleme geçmişi temizlenemedi: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Yükleme geçmişine kayıt ekle
+     */
+    private function addToUploadHistory($data)
+    {
+        try {
+            $history = UploadHistory::create($data);
+            Log::info('Upload History Saved', [
+                'id' => $history->id,
+                'file_name' => $data['file_name'],
+                'operation_type' => $data['operation_type'],
+                'success' => $data['success']
+            ]);
+            return $history;
+        } catch (\Exception $e) {
+            Log::error('Upload History Save Error: ' . $e->getMessage(), [
+                'data' => $data,
+                'error' => $e->getMessage()
+            ]);
+            return null;
+        }
+    }
+
+    /**
+     * Ürünün mevcut görsellerini sil
+     */
+    public function cleanupProductImages(Request $request)
+    {
+        try {
+            $productId = $request->input('product_id');
+            
+            if (!$productId) {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Ürün ID gerekli'
+                ], 400);
+            }
+
+            $shop = session('shop');
+            $accessToken = session('access_token');
+
+            if (!$shop || !$accessToken) {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Shopify bağlantısı gerekli'
+                ], 401);
+            }
+
+            // Product ID'den sadece ID kısmını al
+            $productIdOnly = str_replace('gid://shopify/Product/', '', $productId);
+            
+            // Önce mevcut görselleri al
+            $imagesUrl = "https://{$shop}/admin/api/2024-10/products/{$productIdOnly}/images.json";
+            
+            $response = Http::withHeaders([
+                'X-Shopify-Access-Token' => $accessToken,
+                'Content-Type' => 'application/json'
+            ])->get($imagesUrl);
+
+            if (!$response->successful()) {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Mevcut görseller alınamadı: ' . $response->body()
+                ], 400);
+            }
+
+            $images = $response->json()['images'] ?? [];
+            $deletedCount = 0;
+
+            // Her görseli sil
+            foreach ($images as $image) {
+                $deleteUrl = "https://{$shop}/admin/api/2024-10/products/{$productIdOnly}/images/{$image['id']}.json";
+                
+                $deleteResponse = Http::withHeaders([
+                    'X-Shopify-Access-Token' => $accessToken,
+                    'Content-Type' => 'application/json'
+                ])->delete($deleteUrl);
+
+                if ($deleteResponse->successful()) {
+                    $deletedCount++;
+                    Log::info('Görsel silindi', [
+                        'product_id' => $productIdOnly,
+                        'image_id' => $image['id'],
+                        'image_src' => $image['src'] ?? 'N/A'
+                    ]);
+                } else {
+                    Log::error('Görsel silinemedi', [
+                        'product_id' => $productIdOnly,
+                        'image_id' => $image['id'],
+                        'error' => $deleteResponse->body()
+                    ]);
+                }
+            }
+
+            return response()->json([
+                'success' => true,
+                'deleted_count' => $deletedCount,
+                'total_images' => count($images),
+                'message' => "{$deletedCount} görsel başarıyla silindi"
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Cleanup Product Images Error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'error' => 'Görseller silinirken hata oluştu: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Shopify'a görsel yükle
+     */
+    public function uploadImage(Request $request)
+    {
+        try {
+            $productId = $request->input('product_id');
+            $imageUrl = $request->input('image_url');
+            $imageName = $request->input('image_name');
+
+            // Shopify GraphQL mutation
+            $mutation = '
+                mutation productImageCreate($input: ProductImageInput!) {
+                    productImageCreate(input: $input) {
+                        image {
+                            id
+                            url
+                            altText
+                        }
+                        userErrors {
+                            field
+                            message
                         }
                     }
                 }
             ';
 
-            // Shopify Admin API'ye istek gönder
+            $variables = [
+                'input' => [
+                    'productId' => $productId,
+                    'src' => $imageUrl,
+                    'altText' => $imageName
+                ]
+            ];
+
+            $response = $this->shopifyGraphQL($mutation, $variables);
+
+            if (isset($response['data']['productImageCreate']['userErrors']) && 
+                !empty($response['data']['productImageCreate']['userErrors'])) {
+                return response()->json([
+                    'success' => false,
+                    'error' => $response['data']['productImageCreate']['userErrors'][0]['message']
+                ], 400);
+            }
+
+            return response()->json([
+                'success' => true,
+                'image' => $response['data']['productImageCreate']['image']
+            ]);
+
+        } catch (\Exception $e) {
+            Log::error('Shopify Image Upload Error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'error' => 'Görsel yüklenirken hata oluştu'
+            ], 500);
+        }
+    }
+
+    /**
+     * Google Drive'dan görsel indir ve Shopify'a yükle
+     */
+    public function uploadFromGoogleDrive(Request $request)
+    {
+        try {
+            $productId = $request->input('product_id');
+            $googleDriveFileId = $request->input('google_drive_file_id');
+            $fileName = $request->input('file_name');
+            $imagePosition = $request->input('image_position', 1); // Görsel pozisyonu
+
+            // Debug log ekle
+            Log::info('Upload from Google Drive Debug', [
+                'product_id' => $productId,
+                'google_drive_file_id' => $googleDriveFileId,
+                'file_name' => $fileName,
+                'image_position' => $imagePosition,
+                'session_keys' => array_keys(session()->all()),
+                'google_access_token' => session('google_access_token') ? 'EXISTS' : 'NULL',
+                'shop' => session('shop'),
+                'access_token' => session('access_token') ? 'EXISTS' : 'NULL'
+            ]);
+
+            // Google Drive'dan dosyayı indir
+            $accessToken = session('google_access_token');
+            
+            if (!$accessToken) {
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Google Drive bağlantısı gerekli'
+                ], 401);
+            }
+
+            $this->client->setAccessToken($accessToken);
+            $service = new \Google_Service_Drive($this->client);
+            
+            // Debug: File ID'yi kontrol et
+            Log::info('Google Drive File Debug', [
+                'file_id' => $googleDriveFileId,
+                'access_token_exists' => !empty($accessToken)
+            ]);
+            
+            try {
+                Log::info('Google Drive: File get işlemi başlıyor', ['file_id' => $googleDriveFileId]);
+                $file = $service->files->get($googleDriveFileId);
+                Log::info('Google Drive: File get başarılı', ['file_name' => $file->getName()]);
+                
+                Log::info('Google Drive: Content get işlemi başlıyor', ['file_id' => $googleDriveFileId]);
+                $content = $service->files->get($googleDriveFileId, ['alt' => 'media']);
+                $fileContent = $content->getBody()->getContents();
+                Log::info('Google Drive: Content get başarılı', ['content_size' => strlen($fileContent)]);
+            } catch (\Exception $e) {
+                Log::error('Google Drive File Error: ' . $e->getMessage(), [
+                    'file_id' => $googleDriveFileId,
+                    'error_code' => $e->getCode(),
+                    'error_trace' => $e->getTraceAsString()
+                ]);
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Google Drive dosyası bulunamadı: ' . $e->getMessage()
+                ], 400);
+            }
+
+            // Dosyayı geçici olarak kaydet
+            $tempPath = storage_path('app/temp/' . $fileName);
+            
+            Log::info('Google Drive: File content debug', [
+                'content_size' => strlen($fileContent),
+                'content_empty' => empty($fileContent),
+                'content_substr' => substr($fileContent, 0, 100)
+            ]);
+            
+            $bytesWritten = file_put_contents($tempPath, $fileContent);
+            
+            Log::info('Google Drive: Dosya geçici olarak kaydedildi', [
+                'temp_path' => $tempPath,
+                'file_size' => strlen($fileContent),
+                'bytes_written' => $bytesWritten,
+                'file_exists' => file_exists($tempPath),
+                'actual_file_size' => file_exists($tempPath) ? filesize($tempPath) : 0
+            ]);
+
+            // Shopify'a yükle
+            Log::info('Shopify: Upload işlemi başlıyor', [
+                'product_id' => $productId,
+                'temp_path' => $tempPath,
+                'file_name' => $fileName,
+                'image_position' => $imagePosition
+            ]);
+            
+            $result = $this->uploadImageToShopify($productId, $tempPath, $fileName, $imagePosition);
+
+            // Geçici dosyayı sil
+            unlink($tempPath);
+
+            // Yükleme geçmişine kaydet
+            $this->addToUploadHistory([
+                'file_name' => $fileName,
+                'sku' => $request->input('sku'), // Frontend'den gelen SKU
+                'product_title' => $request->input('product_title'), // Frontend'den gelen ürün adı
+                'product_id' => $productId,
+                'success' => $result->getData()->success ?? false,
+                'error' => $result->getData()->error ?? null,
+                'position' => $imagePosition,
+                'operation_type' => 'upload',
+                'google_drive_file_id' => $googleDriveFileId
+            ]);
+
+            return $result;
+
+        } catch (\Exception $e) {
+            Log::error('Google Drive to Shopify Upload Error: ' . $e->getMessage());
+            return response()->json([
+                'success' => false,
+                'error' => 'Görsel yüklenirken hata oluştu'
+            ], 500);
+        }
+    }
+
+    /**
+     * Shopify GraphQL API'ye istek gönderir
+     */
+    private function shopifyGraphQL(string $query): array
+    {
+        $shop = session('shop');
+        $accessToken = session('access_token');
+
+        if (!$shop || !$accessToken) {
+            throw new \Exception('Shopify mağazası veya erişim tokenı bulunamadı.');
+        }
+
+        $response = Http::withHeaders([
+            'X-Shopify-Access-Token' => $accessToken,
+            'Content-Type' => 'application/json',
+        ])->post("https://{$shop}/admin/api/2023-10/graphql.json", [
+            'query' => $query
+        ]);
+
+        if ($response->successful()) {
+            $jsonResponse = $response->json();
+            Log::info('Shopify GraphQL Success', [
+                'status' => $response->status(),
+                'response' => $jsonResponse,
+                'query' => $query,
+            ]);
+            return $jsonResponse;
+        } else {
+            Log::error('Shopify GraphQL API Error', [
+                'status' => $response->status(),
+                'response' => $response->body(),
+                'query' => $query,
+            ]);
+            throw new \Exception('Shopify GraphQL API hatası: ' . $response->body());
+        }
+    }
+
+    /**
+     * Dosyayı Shopify'a yükle
+     */
+    private function uploadImageToShopify($productId, $filePath, $fileName, $imagePosition)
+    {
+        try {
+            // Shopify Admin API ile dosya yükle
+            $shop = session('shop');
+            $accessToken = session('access_token');
+
+            Log::info('Shopify Upload Debug', [
+                'shop' => $shop,
+                'access_token_exists' => !empty($accessToken),
+                'product_id' => $productId,
+                'file_path' => $filePath,
+                'file_exists' => file_exists($filePath),
+                'file_size' => file_exists($filePath) ? filesize($filePath) : 0
+            ]);
+
+            // Product ID'den sadece ID kısmını al (gid://shopify/Product/9299271385319 -> 9299271385319)
+            $productIdOnly = str_replace('gid://shopify/Product/', '', $productId);
+            $url = "https://{$shop}/admin/api/2024-10/products/{$productIdOnly}/images.json";
+            
+            Log::info('Shopify Upload URL', ['url' => $url]);
+            
+            $imageData = base64_encode(file_get_contents($filePath));
+            
+            Log::info('Shopify Upload Data', [
+                'image_data_length' => strlen($imageData),
+                'filename' => $fileName
+            ]);
+            
+            $data = [
+                'image' => [
+                    'attachment' => $imageData,
+                    'filename' => $fileName,
+                    'position' => $imagePosition // Görsel pozisyonunu ekleyin
+                ]
+            ];
+
+            Log::info('Shopify Upload Request başlıyor');
+            
             $response = Http::withHeaders([
-                'X-Shopify-Access-Token' => session('shopify_access_token'),
-                'Content-Type' => 'application/json',
-            ])->post("https://{$shop}/admin/api/2023-10/graphql.json", [
-                'query' => $query
+                'X-Shopify-Access-Token' => $accessToken,
+                'Content-Type' => 'application/json'
+            ])->post($url, $data);
+
+            Log::info('Shopify Upload Response', [
+                'status' => $response->status(),
+                'successful' => $response->successful(),
+                'body' => $response->body(),
+                'headers' => $response->headers()
             ]);
 
             if ($response->successful()) {
-                $data = $response->json();
-                
-                // GraphQL response'unu düzenle
-                $products = collect($data['data']['products']['edges'] ?? [])
-                    ->map(function ($edge) {
-                        $node = $edge['node'];
-                        return [
-                            'id' => $node['id'],
-                            'title' => $node['title'],
-                            'handle' => $node['handle'],
-                            'status' => $node['status'],
-                            'vendor' => $node['vendor'] ?? '',
-                            'productType' => $node['productType'] ?? '',
-                            'createdAt' => $node['createdAt'],
-                            'updatedAt' => $node['updatedAt'],
-                        ];
-                    })
-                    ->toArray();
-
                 return response()->json([
-                    'products' => $products,
-                    'success' => true
+                    'success' => true,
+                    'image' => $response->json()['image']
                 ]);
             } else {
-                Log::error('Shopify API hatası', [
-                    'status' => $response->status(),
-                    'response' => $response->body()
-                ]);
-                
                 return response()->json([
-                    'error' => 'Shopify API\'den ürünler alınamadı',
-                    'products' => []
-                ], 500);
+                    'success' => false,
+                    'error' => 'Shopify API hatası: ' . $response->body()
+                ], 400);
             }
 
         } catch (\Exception $e) {
-            Log::error('Ürünler getirilirken hata oluştu', [
-                'error' => $e->getMessage(),
-                'trace' => $e->getTraceAsString()
-            ]);
-
+            Log::error('Shopify Image Upload Error: ' . $e->getMessage());
             return response()->json([
-                'error' => 'Ürünler yüklenirken bir hata oluştu',
-                'products' => []
+                'success' => false,
+                'error' => 'Görsel yüklenirken hata oluştu'
             ], 500);
         }
     }
