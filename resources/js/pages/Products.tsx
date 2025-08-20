@@ -41,18 +41,49 @@ export default function Products() {
   ];
 
   useEffect(() => {
+    console.log('Products sayfası yükleniyor...');
+    
+    // SendBeacon hatalarını yakalamak için
+    const originalSendBeacon = navigator.sendBeacon;
+    navigator.sendBeacon = function(url, data) {
+      try {
+        return originalSendBeacon.call(this, url, data);
+      } catch (error) {
+        console.warn('SendBeacon hatası yakalandı:', error);
+        return false;
+      }
+    };
+
     axios.get('/api/shopify/products')
       .then(res => {
-        setProducts(res.data.products || []);
+        console.log('API yanıtı:', res.data);
+        if (res.data.success && res.data.products) {
+          console.log('Gerçek Shopify ürünleri yüklendi:', res.data.products.length);
+          console.log('Ürünler:', res.data.products);
+          setProducts(res.data.products);
+          setError(null);
+        } else {
+          console.log('API başarısız, test verisi kullanılıyor');
+          setProducts(testProducts);
+          setError('Shopify API bağlantısı kurulamadı, test verisi gösteriliyor');
+        }
       })
       .catch(err => {
         console.error("Ürünler alınırken hata:", err);
-        // API başarısız olursa test verisini kullan
         console.log('Shopify API bağlantısı yok, test verisi kullanılıyor');
         setProducts(testProducts);
+        setError('Shopify API bağlantısı kurulamadı, test verisi gösteriliyor');
       })
-      .finally(() => setLoading(false));
+      .finally(() => {
+        setLoading(false);
+      });
   }, []);
+
+  // State değişikliklerini izle
+  useEffect(() => {
+    console.log('Products state güncellendi, ürün sayısı:', products.length);
+    console.log('Ürünler:', products);
+  }, [products]);
 
   const rows = products.map(product => [
     product.title,
@@ -64,13 +95,16 @@ export default function Products() {
   return (
     <Page title="Ürün Listesi">
       {error && (
-        <Banner tone="critical" onDismiss={() => setError(null)}>
+        <Banner tone="warning" onDismiss={() => setError(null)}>
           <p>{error}</p>
         </Banner>
       )}
       
       {loading ? (
-        <Spinner accessibilityLabel="Yükleniyor" size="large" />
+        <div style={{ textAlign: 'center', padding: '2rem' }}>
+          <Spinner accessibilityLabel="Yükleniyor" size="large" />
+          <p>Ürünler yükleniyor...</p>
+        </div>
       ) : (
         <Card>
           <DataTable
@@ -78,6 +112,11 @@ export default function Products() {
             headings={['Başlık', 'Tedarikçi', 'Ürün Türü', 'Durum']}
             rows={rows}
           />
+          {products.length === 0 && (
+            <div style={{ padding: '1rem', textAlign: 'center', color: '#666' }}>
+              Henüz ürün bulunamadı.
+            </div>
+          )}
         </Card>
       )}
     </Page>

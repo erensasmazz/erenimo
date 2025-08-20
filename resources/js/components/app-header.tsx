@@ -21,6 +21,16 @@ const mainNavItems: NavItem[] = [
         href: '/dashboard',
         icon: LayoutGrid,
     },
+    {
+        title: 'Products',
+        href: '/products',
+        icon: Folder,
+    },
+    {
+        title: 'Google Drive',
+        href: '/google-drive-app',
+        icon: Folder,
+    },
 ];
 
 const rightNavItems: NavItem[] = [
