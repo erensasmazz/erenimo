@@ -1,0 +1,1247 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { Page, Layout, Card, Button, Text, Thumbnail, Modal, DataTable, Badge, TextField, Checkbox } from '@shopify/polaris';
+
+// Google Picker API için global type declarations
+declare global {
+    interface Window {
+        gapi: any;
+        google: any;
+    }
+}
+
+interface GoogleDriveFile {
+    id: string;
+    name: string;
+    size: string;
+    mime_type: string;
+    thumbnail: string;
+    download_url: string;
+    view_url: string;
+}
+
+interface ShopifyProduct {
+    id: string;
+    title: string;
+    vendor: string;
+    productType: string;
+    status: string;
+    handle: string;
+    description: string;
+    sku: string;
+    skus: string[];
+    image: string | null;
+}
+
+interface UploadResult {
+    fileName: string;
+    sku: string;
+    productTitle: string;
+    success: boolean;
+    error?: string;
+    position?: number;
+}
+
+interface PickerConfig {
+    developerKey: string;
+    clientId: string;
+    scope: string;
+    appId: string;
+}
+
+export default function GoogleDrivePage() {
+    const [files, setFiles] = useState<GoogleDriveFile[]>([]);
+    const [pageSize] = useState<number>(50);
+    const [currentPage, setCurrentPage] = useState<number>(1);
+    const [cachedPages, setCachedPages] = useState<Record<number, GoogleDriveFile[]>>({});
+    const [pageTokens, setPageTokens] = useState<Record<number, string | null>>({ 1: null });
+    const [hasMore, setHasMore] = useState<boolean>(true);
+    const [visibleFiles, setVisibleFiles] = useState<GoogleDriveFile[]>([]);
+    const [products, setProducts] = useState<ShopifyProduct[]>([]);
+    // Görsel seçimi kaldırıldı - otomatik eşleşen tüm görseller yüklenecek
+    const [isLoading, setIsLoading] = useState(false);
+    const [error, setError] = useState<string | null>(null);
+    const [showResultsModal, setShowResultsModal] = useState(false);
+    const [uploadResults, setUploadResults] = useState<UploadResult[]>([]);
+    const [isUploading, setIsUploading] = useState(false);
+    const [selectedFolder, setSelectedFolder] = useState<string | null>(null);
+    const [folderName, setFolderName] = useState<string>('All Files');
+    const [pickerConfig, setPickerConfig] = useState<PickerConfig | null>(null);
+    const [isPickerLoaded, setIsPickerLoaded] = useState(false);
+    const [folders, setFolders] = useState<any[]>([]); // Klasör seçici için state
+    const [showFolderModal, setShowFolderModal] = useState(false); // Klasör seçici modalı için state
+    
+    // Yeni state'ler - Arama ve filtreleme için
+    const [fileSearchTerm, setFileSearchTerm] = useState('');
+    const [productSearchTerm, setProductSearchTerm] = useState('');
+    const [showOnlyMatchingFiles, setShowOnlyMatchingFiles] = useState(true);
+    const [clearExistingImages, setClearExistingImages] = useState(false);
+    
+    // Upload Job Progress için yeni state'ler
+    const [showUploadJobPage, setShowUploadJobPage] = useState(false);
+    const [showMatchingResultsPage, setShowMatchingResultsPage] = useState(false);
+    const [uploadJobId, setUploadJobId] = useState<string>('');
+    const [uploadProgress, setUploadProgress] = useState(0);
+    const [totalImages, setTotalImages] = useState(0);
+    const [uploadedImages, setUploadedImages] = useState(0);
+    const [uploadLogs, setUploadLogs] = useState<string[]>([]);
+    const [isUploadJobRunning, setIsUploadJobRunning] = useState(false);
+    const [uploadJobDetails, setUploadJobDetails] = useState({
+        folderName: '',
+        matchingType: 'Match by exact SKU',
+        replaceExisting: false,
+        totalImagesInFolder: 0,
+        selectedImages: 0,
+        matchedImages: 0,
+        nonMatchedImages: 0
+    });
+    const [matchedImagesList, setMatchedImagesList] = useState<any[]>([]);
+
+    // Google Picker API'yi yükle - Artık gerekli değil
+    useEffect(() => {
+        // Google Picker API deprecated olduğu için sadece config'i yükle
+        loadPickerConfig();
+    }, []);
+
+    // Google Drive bağlantısını kontrol et
+    useEffect(() => {
+        checkGoogleDriveSession();
+    }, []);
+
+    const loadFiles = useCallback(async (targetPage: number = 1) => {
+        try {
+            setIsLoading(true);
+            
+            // URL ve parametreleri hazırla
+            let url = `/api/google/files?page_size=${pageSize}`;
+            
+            // Eğer klasör seçiliyse, klasör ID'sini query parameter olarak ekle
+            if (selectedFolder) {
+                url += `&folder_id=${encodeURIComponent(selectedFolder)}`;
+            }
+            // Sayfa token'ı (1. sayfa için null)
+            const tokenToUse = pageTokens[targetPage];
+            if (tokenToUse) {
+                url += `&page_token=${encodeURIComponent(tokenToUse)}`;
+            }
+            
+            console.log('Loading files:', { url, selectedFolder, folderName });
+            
+            // Dynamic CSRF token fetch
+            const csrfResponse = await fetch('/api/csrf-token');
+            const csrfData = await csrfResponse.json();
+            
+            const response = await fetch(url, {
+                method: 'GET',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-CSRF-TOKEN': csrfData.csrf_token,
+                    'Accept': 'application/json',
+                    'X-Session-ID': localStorage.getItem('google_session_id') || ''
+                }
+            });
+
+            const data = await response.json();
+            
+            if (data.success) {
+                // Cache this page
+                const newCached = { ...cachedPages, [targetPage]: data.files } as Record<number, GoogleDriveFile[]>;
+                setCachedPages(newCached);
+                // Update tokens for next page
+                setPageTokens(prev => ({ ...prev, [targetPage + 1]: data.next_page_token || null }));
+                setHasMore(!!data.next_page_token);
+                setCurrentPage(targetPage);
+                setVisibleFiles(data.files);
+                // Aggregate all loaded files (for matching/upload logic)
+                const orderedPages = Object.keys(newCached).map(n => parseInt(n, 10)).sort((a,b) => a - b);
+                const merged: GoogleDriveFile[] = [];
+                orderedPages.forEach(p => {
+                    merged.push(...(newCached[p] || []));
+                });
+                setFiles(merged);
+                console.log(`Files loaded for page ${targetPage}: ${data.files.length} files, folder: ${selectedFolder || 'All Files'}`);
+            } else {
+                setError(data.error || 'Files could not be loaded');
+            }
+        } catch (err) {
+            console.error('Error while loading files:', err);
+            setError('Error occurred while loading files');
+        } finally {
+            setIsLoading(false);
+        }
+    }, [selectedFolder, folderName, pageSize, pageTokens, cachedPages]);
+
+    // Pagination reset helper
+    const resetPagination = useCallback(() => {
+        setCurrentPage(1);
+        setCachedPages({});
+        setPageTokens({ 1: null });
+        setHasMore(true);
+        setVisibleFiles([]);
+        setFiles([]);
+    }, []);
+
+    // Automatically load files when folder is selected (or cleared)
+    useEffect(() => {
+        resetPagination();
+        loadFiles(1);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [selectedFolder]);
+
+    const loadGooglePickerAPI = async () => {
+        // Google Picker API is deprecated, so this function is no longer used
+        console.log('Google Picker API deprecated - alternative solution being used');
+        loadPickerConfig();
+    };
+
+    const initializePicker = () => {
+        // Google Picker API is deprecated, so this function is no longer used
+        console.log('Google Picker API deprecated - alternative solution being used');
+        loadPickerConfig();
+    };
+
+    const loadPickerConfig = async () => {
+        try {
+            const response = await fetch('/api/google/picker-config', {
+                headers: {
+                    'X-Session-ID': localStorage.getItem('google_session_id') || ''
+                }
+            });
+            const data = await response.json();
+            
+            if (data.success) {
+                setPickerConfig(data.config);
+            } else {
+                console.error('Picker config could not be loaded:', data.error);
+                setError('Picker config could not be loaded');
+            }
+        } catch (err) {
+            console.error('Picker config could not be loaded:', err);
+            setError('Picker config could not be loaded');
+        }
+    };
+
+    const checkGoogleDriveSession = async () => {
+        try {
+            const response = await fetch('/api/google/auth-url', {
+                headers: {
+                    'X-Session-ID': localStorage.getItem('google_session_id') || ''
+                }
+            });
+            const data = await response.json();
+            
+            if (!data.success) {
+                setError('Google Drive connection required');
+            } else {
+                setError(null);
+                resetPagination();
+                loadFiles(1);
+                // Ensure products are loaded for matching logic
+                loadProducts();
+            }
+        } catch (err) {
+            setError('Connection error');
+        }
+    };
+
+    const loadProducts = async () => {
+        try {
+            const response = await fetch('/api/shopify/products');
+            const data = await response.json();
+            if (data.success) {
+                setProducts(data.products);
+            }
+        } catch (_) {
+            // no-op; product count is optional on this page
+        }
+    };
+
+    const handleGoogleDriveConnect = async () => {
+        try {
+            const response = await fetch('/api/google/auth-url');
+            const data = await response.json();
+            
+            if (data.success) {
+                // Popup ile OAuth aç
+                const popup = window.open(
+                    data.auth_url,
+                    'google-oauth',
+                    'width=500,height=600,scrollbars=yes,resizable=yes'
+                );
+                
+                // Popup'tan mesaj dinle
+                const handleMessage = (event: MessageEvent) => {
+                    if (event.origin !== window.location.origin) return;
+                    
+                    if (event.data.status === 'success') {
+                        // Session ID'yi localStorage'a kaydet
+                        if (event.data.session_id) {
+                            localStorage.setItem('google_session_id', event.data.session_id);
+                        }
+                        
+                        // Dosyaları yeniden yükle
+                        loadFiles();
+                        setError(null);
+                        popup?.close();
+                    } else if (event.data.status === 'error') {
+                        setError(event.data.message || 'Google Drive connection failed');
+                        popup?.close();
+                    }
+                };
+                
+                window.addEventListener('message', handleMessage);
+                
+                // Popup kapandığında event listener'ı temizle
+                const checkClosed = setInterval(() => {
+                    if (popup?.closed) {
+                        window.removeEventListener('message', handleMessage);
+                        clearInterval(checkClosed);
+                    }
+                }, 1000);
+                
+            } else {
+                setError('Google Drive connection could not be established');
+            }
+        } catch (err) {
+            setError('Error occurred during Google Drive connection');
+        }
+    };
+
+        // Görsel seçimi kaldırıldı - otomatik eşleşen tüm görseller yüklenecek
+
+    const handleFolderPicker = async () => {
+        try {
+            // Get access token
+            const tokenResponse = await fetch('/api/google/access-token', {
+                headers: {
+                    'X-Session-ID': localStorage.getItem('google_session_id') || ''
+                }
+            });
+            const tokenData = await tokenResponse.json();
+            
+            if (!tokenData.success) {
+                setError('Access token could not be obtained: ' + (tokenData.error || 'Unknown error'));
+                return;
+            }
+
+            // Google Drive API kullanarak klasörleri listele
+            const response = await fetch('/api/google/folders', {
+                headers: {
+                    'X-Session-ID': localStorage.getItem('google_session_id') || ''
+                }
+            });
+            const data = await response.json();
+            
+            if (data.success) {
+                // Klasör seçici modal'ı göster
+                setFolders(data.folders);
+                setShowFolderModal(true);
+            } else {
+                setError('Folders could not be listed: ' + (data.error || 'Unknown error'));
+            }
+        } catch (err) {
+            console.error('Folder picker error:', err);
+            setError('Folder picker could not be opened: ' + (err instanceof Error ? err.message : 'Unknown error'));
+        }
+    };
+
+    const clearFolderSelection = () => {
+        setSelectedFolder(null);
+        setFolderName('All Files');
+        // Pagination will reset and first page will load via useEffect
+    };
+
+    // SKU-görsel adı otomatik eşleştirme
+    const matchFileToProduct = (fileName: string): ShopifyProduct | null => {
+        // Dosya uzantısını kaldır
+        const nameWithoutExtension = fileName.replace(/\.[^/.]+$/, '');
+        
+        // ERENIMO-TEST-002 formatını kontrol et
+        // ERENIMO-TEST-002-2.jpg -> ERENIMO-TEST-002
+        // ERENIMO-TEST-002.jpg -> ERENIMO-TEST-002
+        
+        // Önce tam eşleşme dene
+        let matchedProduct = products.find(product => product.sku === nameWithoutExtension);
+        if (matchedProduct) {
+            return matchedProduct;
+        }
+        
+        // Sonra tire ile ayrılmış parçaları kontrol et
+        const parts = nameWithoutExtension.split('-');
+        if (parts.length >= 3) {
+            // Check last part
+            const lastPart = parts[parts.length - 1];
+            
+            // If last part is numeric and there's a numeric part before it
+            if (/^\d+$/.test(lastPart)) {
+                // Extract last part and create SKU
+                const skuParts = parts.slice(0, -1);
+                const sku = skuParts.join('-');
+                return products.find(product => product.sku === sku) || null;
+            }
+        }
+        
+        // Finally try with regex
+        const skuMatch = nameWithoutExtension.match(/^([A-Z0-9-]+?)(?:-\d+)?$/);
+        if (skuMatch) {
+            const baseSku = skuMatch[1];
+            return products.find(product => product.sku === baseSku) || null;
+        }
+        
+        return null;
+    };
+
+    // Get filtered files (all loaded files)
+    const getFilteredFiles = () => {
+        let filteredFiles = files;
+
+        // File name search
+        if (fileSearchTerm) {
+            filteredFiles = filteredFiles.filter(file => 
+                file.name.toLowerCase().includes(fileSearchTerm.toLowerCase())
+            );
+        }
+
+        // Show only matching files
+        if (showOnlyMatchingFiles) {
+            filteredFiles = filteredFiles.filter(file => matchFileToProduct(file.name));
+        }
+
+        return filteredFiles;
+    };
+
+    // Get filtered files for current visible page
+    const getVisibleFilteredFiles = () => {
+        let filtered = visibleFiles;
+        if (fileSearchTerm) {
+            filtered = filtered.filter(file => 
+                file.name.toLowerCase().includes(fileSearchTerm.toLowerCase())
+            );
+        }
+        if (showOnlyMatchingFiles) {
+            filtered = filtered.filter(file => matchFileToProduct(file.name));
+        }
+        return filtered;
+    };
+
+    // Function to check file match status
+    const checkFileMatch = (file: GoogleDriveFile) => {
+        return matchFileToProduct(file.name) !== null;
+    };
+
+    // Get filtered products
+    const getFilteredProducts = () => {
+        let filteredProducts = products;
+
+        // Product name/SKU search
+        if (productSearchTerm) {
+            filteredProducts = filteredProducts.filter(product => 
+                product.title.toLowerCase().includes(productSearchTerm.toLowerCase()) ||
+                (product.sku && product.sku.toLowerCase().includes(productSearchTerm.toLowerCase()))
+            );
+        }
+
+        return filteredProducts;
+    };
+
+    // Group files by SKU
+    const groupFilesBySKU = () => {
+        const groupedFiles: { [sku: string]: GoogleDriveFile[] } = {};
+        
+        files.forEach(file => {
+            const matchedProduct = matchFileToProduct(file.name);
+            if (matchedProduct && matchedProduct.sku) {
+                const sku = matchedProduct.sku;
+                if (!groupedFiles[sku]) {
+                    groupedFiles[sku] = [];
+                }
+                groupedFiles[sku].push(file);
+            }
+        });
+        
+        return groupedFiles;
+    };
+
+    // Format file size
+    const formatFileSize = (bytes: string) => {
+        const size = parseInt(bytes);
+        if (size < 1024) return `${size} B`;
+        if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+        return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+    };
+
+    // Show Upload Job page
+    const showUploadJobProgress = () => {
+        const matchedFiles = getFilteredFiles().filter(file => matchFileToProduct(file.name));
+        const nonMatchedFiles = getFilteredFiles().filter(file => !matchFileToProduct(file.name));
+        
+        setUploadJobDetails({
+            folderName: selectedFolder ? folderName : 'All Files',
+            matchingType: 'Match by exact SKU',
+            replaceExisting: clearExistingImages,
+            totalImagesInFolder: files.length,
+            selectedImages: matchedFiles.length,
+            matchedImages: matchedFiles.length,
+            nonMatchedImages: nonMatchedFiles.length
+        });
+        
+        setTotalImages(matchedFiles.length);
+        setUploadedImages(0);
+        setUploadProgress(0);
+        setUploadLogs([]);
+        setUploadJobId(`#${Math.floor(Math.random() * 100000)}`);
+        setIsUploadJobRunning(true);
+        setShowUploadJobPage(true);
+    };
+
+    // Add upload log
+    const addUploadLog = (message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info') => {
+        const timestamp = new Date().toLocaleString('en-US');
+        const logEntry = `[${timestamp}] [${type}] ${message}`;
+        setUploadLogs(prev => [...prev, logEntry]);
+    };
+
+    // Stop upload job
+    const stopUploadJob = () => {
+        setIsUploadJobRunning(false);
+        addUploadLog('Upload job stopped', 'warning');
+    };
+
+    // Perform matching analysis and show Matching Results page
+    const analyzeMatching = () => {
+        const matched: any[] = [];
+        const nonMatched: any[] = [];
+
+        // Tüm dosyaları kontrol et - seçim yapmaya gerek yok
+        files.forEach(file => {
+            const matchedProduct = products.find(product => {
+                return product.skus.some(sku => 
+                    file.name.toLowerCase().includes(sku.toLowerCase())
+                );
+            });
+
+            if (matchedProduct) {
+                const sku = matchedProduct.skus.find(sku => 
+                    file.name.toLowerCase().includes(sku.toLowerCase())
+                );
+                matched.push({
+                    file,
+                    product: matchedProduct,
+                    sku,
+                    position: 1
+                });
+            } else {
+                nonMatched.push({ file });
+            }
+        });
+
+        setMatchedImagesList(matched);
+        setUploadJobDetails(prev => ({
+            ...prev,
+            folderName: folderName || 'Demo-2024',
+            totalImagesInFolder: files.length,
+            selectedImages: matched.length, // Eşleşen tüm dosyalar
+            matchedImages: matched.length,
+            nonMatchedImages: nonMatched.length,
+            replaceExisting: clearExistingImages
+        }));
+
+        setShowMatchingResultsPage(true);
+    };
+
+    // Automatic bulk upload - now called from Matching Results
+    const handleBulkUpload = async () => {
+        // Show Upload Job page
+        showUploadJobProgress();
+        
+        // Start upload process
+        setTimeout(() => startUploadProcess(), 1000);
+    };
+
+    // Start upload process
+    const startUploadProcess = async () => {
+        addUploadLog('Starting upload...');
+        
+        const groupedFiles = groupFilesBySKU();
+        let currentUploaded = 0;
+        
+        // Calculate total files to upload
+        const totalFilesToUpload = matchedImagesList.length;
+        setTotalImages(totalFilesToUpload);
+        setUploadedImages(0);
+        setUploadProgress(0);
+        
+        addUploadLog(`Total ${totalFilesToUpload} files will be uploaded`, 'info');
+
+        // Process each SKU group
+        for (const [sku, skuFiles] of Object.entries(groupedFiles)) {
+            const matchedProduct = products.find(product => product.sku === sku);
+            if (!matchedProduct) continue;
+
+            // Filter matched files for this SKU
+            const selectedSkuFiles = skuFiles.filter(file => matchFileToProduct(file.name));
+            
+            if (selectedSkuFiles.length === 0) continue;
+
+            // If "Clear existing images" is selected, delete existing images first
+            if (clearExistingImages) {
+                try {
+                    addUploadLog(`Deleting existing images for product ${matchedProduct.title}...`);
+                    
+                    // Get CSRF token dynamically
+                    const csrfResponse = await fetch('/api/csrf-token');
+                    const csrfData = await csrfResponse.json();
+                    
+                    // Delete existing images from Shopify
+                    const deleteResponse = await fetch('/api/shopify/delete-product-images', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRF-TOKEN': csrfData.csrf_token,
+                            'Accept': 'application/json',
+                            'X-Session-ID': localStorage.getItem('google_session_id') || ''
+                        },
+                        credentials: 'same-origin',
+                        body: JSON.stringify({
+                            product_id: matchedProduct.id
+                        })
+                    });
+
+                    const deleteData = await deleteResponse.json();
+                    
+                    if (deleteData.success) {
+                        addUploadLog(`✅ Existing images deleted for product ${matchedProduct.title}`, 'success');
+                    } else {
+                        addUploadLog(`⚠️ Could not delete images for product ${matchedProduct.title}: ${deleteData.error}`, 'warning');
+                    }
+                } catch (err) {
+                    addUploadLog(`❌ Error deleting images for product ${matchedProduct.title}: ${err}`, 'error');
+                }
+            }
+
+            // Upload files sequentially
+            for (let i = 0; i < selectedSkuFiles.length; i++) {
+                const file = selectedSkuFiles[i];
+                
+                try {
+                    addUploadLog(`Uploading file ${file.name} to product ${matchedProduct.title}... (${matchedProduct.sku})`);
+                    
+                    // Dynamic CSRF token fetch
+                    const csrfResponse = await fetch('/api/csrf-token');
+                    const csrfData = await csrfResponse.json();
+                    
+                    // Debug: Upload request data
+                    console.log('Upload Request:', {
+                        file: file.name,
+                        product: matchedProduct.title,
+                        has_csrf: !!csrfData.csrf_token,
+                        has_session: !!localStorage.getItem('google_session_id')
+                    });
+                    
+                    const response = await fetch('/api/shopify/upload-from-google-drive', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                            'X-CSRF-TOKEN': csrfData.csrf_token,
+                            'Accept': 'application/json',
+                            'X-Session-ID': localStorage.getItem('google_session_id') || ''
+                        },
+                        credentials: 'same-origin',
+                        body: JSON.stringify({
+                            product_id: matchedProduct.id,
+                            google_drive_file_id: file.id,
+                            file_name: file.name,
+                            image_position: i + 1
+                        })
+                    });
+
+                    const data = await response.json();
+                    
+                    // Debug: Upload response
+                    if (!data.success) {
+                        console.error('Upload Failed:', {
+                            file: file.name,
+                            status: response.status,
+                            error: data.error
+                        });
+                    }
+
+                    if (data.success) {
+                        currentUploaded++;
+                        setUploadedImages(currentUploaded);
+                        setUploadProgress((currentUploaded / totalFilesToUpload) * 100);
+                        
+                        addUploadLog(`✅ ${file.name} successfully uploaded to product ${matchedProduct.title}`, 'success');
+                    } else {
+                        addUploadLog(`❌ ${file.name} upload failed: ${data.error}`, 'error');
+                    }
+                } catch (err) {
+                    addUploadLog(`❌ ${file.name} network error during upload`, 'error');
+                }
+            }
+        }
+
+        // Upload completed
+        addUploadLog('Upload completed successfully!', 'success');
+        setIsUploadJobRunning(false);
+        
+        // Add upload completed message
+        addUploadLog('✅ All images uploaded successfully!', 'success');
+        addUploadLog('📱 Click "Back to Main Page" button to return to main page.', 'info');
+        
+        // Automatic page refresh removed - user will return manually
+        // setTimeout(() => {
+        //     setShowUploadJobPage(false);
+        //     loadFiles();
+        //     loadProducts();
+        // }, 3000);
+    };
+
+            if (error && error.includes('Google Drive connection required')) {
+        return (
+            <Page title="Google Drive Image Upload">
+                <Layout>
+                    <Layout.Section>
+                        <Card>
+                            <div style={{ padding: '2rem', textAlign: 'center' }}>
+                                <Text as="h2" variant="headingLg">
+                                    Google Drive Connection Required
+                                </Text>
+                                <Text as="p" variant="bodyMd">
+                                    You need to connect to your Google Drive account to upload images.
+                                </Text>
+                                <div style={{ marginTop: '1rem' }}>
+                                    <Button onClick={handleGoogleDriveConnect}>
+                                        Connect to Google Drive
+                                    </Button>
+                                </div>
+                            </div>
+                        </Card>
+                    </Layout.Section>
+                </Layout>
+            </Page>
+        );
+    }
+
+    // Matching Results sayfası
+    if (showMatchingResultsPage) {
+        return (
+            <Page 
+                title="Match Results"
+                backAction={{
+                    content: 'Back',
+                    onAction: () => {
+                        setShowMatchingResultsPage(false);
+                    }
+                }}
+                secondaryActions={[
+                    {
+                        content: 'Support',
+                        onAction: () => window.open('https://help.shopify.com', '_blank')
+                    }
+                ]}
+            >
+                <Layout>
+                    <Layout.Section>
+                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                            {/* Matching Details */}
+                            <Card>
+                                <div style={{ padding: '1rem' }}>
+                                    <Text as="h3" variant="headingMd" fontWeight="bold">
+                                        Match Details
+                                    </Text>
+                                    <div style={{ marginTop: '1rem', display: 'grid', gap: '0.5rem' }}>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold">Folder:</Text>
+                                            <Text as="p" variant="bodyMd" tone="subdued">{uploadJobDetails.folderName}</Text>
+                                        </div>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold">Match type:</Text>
+                                            <Text as="p" variant="bodyMd" tone="subdued">{uploadJobDetails.matchingType}</Text>
+                                        </div>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold">Replace existing images:</Text>
+                                            <Text as="p" variant="bodyMd" tone="subdued">{uploadJobDetails.replaceExisting ? 'YES' : 'NO'}</Text>
+                                        </div>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold">Total images in folder:</Text>
+                                            <Text as="p" variant="bodyMd" tone="subdued">{uploadJobDetails.totalImagesInFolder}</Text>
+                                        </div>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold">Matched images:</Text>
+                                            <Text as="p" variant="bodyMd" tone="subdued">{uploadJobDetails.selectedImages}</Text>
+                                        </div>
+                                    </div>
+                                </div>
+                            </Card>
+
+                            {/* Matching Results */}
+                            <Card>
+                                <div style={{ padding: '1rem' }}>
+                                    <Text as="h3" variant="headingMd" fontWeight="bold">
+                                        Match Results
+                                    </Text>
+                                    <div style={{ marginTop: '1rem', display: 'grid', gap: '0.5rem' }}>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold" tone="success">Matched Images:</Text>
+                                            <Text as="p" variant="bodyMd" tone="subdued">{uploadJobDetails.matchedImages}</Text>
+                                        </div>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold" tone="critical">Unmatched Images:</Text>
+                                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                                                <Text as="p" variant="bodyMd" tone="subdued">{uploadJobDetails.nonMatchedImages}</Text>
+                                                <Button variant="plain" size="micro">View Details</Button>
+                                            </div>
+                                        </div>
+                                        <div style={{ marginTop: '1rem', display: 'flex', gap: '0.5rem' }}>
+                                            <Button 
+                                                onClick={() => {
+                                                    setShowMatchingResultsPage(false);
+                                                }}
+                                                icon="RefreshIcon"
+                                            >
+                                                Match Again
+                                            </Button>
+                                            <Button 
+                                                onClick={() => {
+                                                    setShowMatchingResultsPage(false);
+                                                    handleBulkUpload();
+                                                }}
+                                                tone="success"
+                                                variant="primary"
+                                            >
+                                                Start Upload
+                                            </Button>
+                                        </div>
+                                    </div>
+                                </div>
+                            </Card>
+                        </div>
+                    </Layout.Section>
+
+                    {/* Matched Images Table */}
+                    <Layout.Section>
+                        <Card>
+                            <div style={{ padding: '1rem' }}>
+                                                                    <Text as="h3" variant="headingMd" fontWeight="bold">
+                                        Matched Images
+                                    </Text>
+                                    
+                                    <div style={{ marginTop: '1rem' }}>
+                                        <DataTable
+                                            columnContentTypes={['text', 'text', 'text', 'numeric', 'text', 'text']}
+                                            headings={['Image Preview', 'Image Name', 'Image Size', 'Position', 'Product / Variant', 'SKU']}
+                                        rows={matchedImagesList.map((match, index) => [
+                                            // Image Preview
+                                            <div key={`preview-${index}`} style={{ width: '60px', height: '60px' }}>
+                                                <Thumbnail
+                                                    source={match.file.thumbnail || '/placeholder-image.png'}
+                                                    alt={match.file.name}
+                                                    size="small"
+                                                />
+                                            </div>,
+                                            // Image Name
+                                            match.file.name,
+                                            // Image Size
+                                            formatFileSize(match.file.size),
+                                            // Position
+                                            match.position,
+                                            // Product / Variant
+                                            <Button variant="plain" size="micro" key={`product-${index}`}>
+                                                {match.product.title}
+                                            </Button>,
+                                            // SKU
+                                            match.sku
+                                        ])}
+                                    />
+                                </div>
+                            </div>
+                        </Card>
+                    </Layout.Section>
+                </Layout>
+            </Page>
+        );
+    }
+
+    // Ana sayfa veya Upload Job Progress sayfasından birini göster
+    if (showUploadJobPage) {
+        return (
+                            <Page 
+                    title={`Upload Job ${uploadJobId}`}
+                    backAction={{
+                        content: 'Back',
+                        onAction: () => {
+                            setShowUploadJobPage(false);
+                        }
+                    }}
+                >
+                    <Layout>
+                        {/* Job Status and Progress */}
+                        <Layout.Section>
+                            <Card>
+                                <div style={{ padding: '1rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                                    <div>
+                                                                    <Text as="h2" variant="headingLg">
+                                Upload Job {uploadJobId}
+                            </Text>
+                                                                                 <Text as="p" variant="bodyMd">
+                                             Total {uploadedImages}/{totalImages} images uploaded
+                                         </Text>
+                                    </div>
+                                    <div style={{ display: 'flex', gap: '0.5rem' }}>
+                                        <Button onClick={() => window.open('https://help.shopify.com', '_blank')}>
+                                            Support
+                                        </Button>
+                                        <Button 
+                                            onClick={stopUploadJob}
+                                            disabled={!isUploadJobRunning}
+                                            tone="critical"
+                                        >
+                                            Stop Job
+                                        </Button>
+                                    </div>
+                                </div>
+                            
+                            {/* Progress Bar */}
+                            <div style={{ padding: '0 1rem 1rem' }}>
+                                <div style={{ 
+                                    width: '100%', 
+                                    height: '20px', 
+                                    backgroundColor: '#e1e3e5', 
+                                    borderRadius: '10px',
+                                    overflow: 'hidden'
+                                }}>
+                                    <div style={{
+                                        width: `${uploadProgress}%`,
+                                        height: '100%',
+                                        backgroundColor: '#95bf47',
+                                        transition: 'width 0.3s ease',
+                                        borderRadius: '10px'
+                                    }} />
+                                </div>
+                            </div>
+                        </Card>
+                    </Layout.Section>
+
+                                            {/* Job Details */}
+                        <Layout.Section>
+                            <Card>
+                                <div style={{ padding: '1rem' }}>
+                                    <Text as="h3" variant="headingMd" fontWeight="bold">
+                                        Job Details
+                                    </Text>
+                                    <div style={{ 
+                                        display: 'grid', 
+                                        gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', 
+                                        gap: '1rem', 
+                                        marginTop: '1rem' 
+                                    }}>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold">Folder Name:</Text>
+                                            <Text as="p" variant="bodyMd">{uploadJobDetails.folderName}</Text>
+                                        </div>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold">Match Type:</Text>
+                                            <Text as="p" variant="bodyMd">{uploadJobDetails.matchingType}</Text>
+                                        </div>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold">Replace Existing Images:</Text>
+                                            <Text as="p" variant="bodyMd">{uploadJobDetails.replaceExisting ? 'YES' : 'NO'}</Text>
+                                        </div>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold">Total Images in Folder:</Text>
+                                            <Text as="p" variant="bodyMd">{uploadJobDetails.totalImagesInFolder}</Text>
+                                        </div>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold">Matched Images:</Text>
+                                            <Text as="p" variant="bodyMd">{uploadJobDetails.selectedImages}</Text>
+                                        </div>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold">Matched Images:</Text>
+                                            <Text as="p" variant="bodyMd">{uploadJobDetails.matchedImages}</Text>
+                                        </div>
+                                        <div>
+                                            <Text as="p" variant="bodySm" fontWeight="bold">Unmatched Images:</Text>
+                                            <Text as="p" variant="bodyMd">{uploadJobDetails.nonMatchedImages}</Text>
+                                        </div>
+                                    </div>
+                                </div>
+                            </Card>
+                        </Layout.Section>
+
+                                            {/* Upload Logs */}
+                        <Layout.Section>
+                            <Card>
+                                <div style={{ padding: '1rem' }}>
+                                    <Text as="h3" variant="headingMd" fontWeight="bold">
+                                        Upload Logs
+                                    </Text>
+                                    <div style={{ 
+                                        maxHeight: '400px', 
+                                        overflowY: 'auto', 
+                                        marginTop: '1rem',
+                                        backgroundColor: '#f6f6f7',
+                                        padding: '1rem',
+                                        borderRadius: '4px',
+                                        fontFamily: 'monospace',
+                                        fontSize: '14px',
+                                        lineHeight: '1.5'
+                                    }}>
+                                        {uploadLogs.length === 0 ? (
+                                            <div style={{ marginBottom: '1rem' }}>
+                                                <Text as="p" variant="bodyMd">
+                                                    Upload logs will appear here...
+                                                </Text>
+                                            </div>
+                                        ) : (
+                                            uploadLogs.map((log, index) => (
+                                                <div key={index} style={{ marginBottom: '0.5rem' }}>
+                                                    {log}
+                                                </div>
+                                            ))
+                                        )}
+                                    </div>
+                                </div>
+                            </Card>
+                        </Layout.Section>
+
+                    {/* Ana Sayfaya Dön Butonu */}
+                    <Layout.Section>
+                        <Card>
+                            <div style={{ padding: '1rem', textAlign: 'center' }}>
+                                <div style={{ marginBottom: '1rem' }}>
+                                    <Text as="p" variant="bodyMd">
+                                        Upload process completed! Click the button below to return to the main page.
+                                    </Text>
+                                </div>
+                                <Button 
+                                    onClick={() => {
+                                                setShowUploadJobPage(false);
+        loadFiles();
+        loadProducts();
+                                    }}
+                                    size="large"
+                                    tone="success"
+                                >
+                                    🏠 Back to Main Page
+                                </Button>
+                            </div>
+                        </Card>
+                    </Layout.Section>
+                </Layout>
+            </Page>
+        );
+    }
+
+    // Main Google Drive page
+    return (
+        <Page title="Google Drive Image Upload">
+            <Layout>
+                {/* Bulk Image Upload - AT THE TOP */}
+                <Layout.Section>
+                    <Card>
+                        <div style={{ padding: '1rem' }}>
+                            <Text as="h3" variant="headingMd" fontWeight="bold">
+                                Bulk Image Upload
+                            </Text>
+                            
+                            <div style={{ marginTop: '1rem', display: 'flex', alignItems: 'center', gap: '1rem' }}>
+                                <Checkbox
+                                    label="Clear existing images"
+                                    checked={clearExistingImages}
+                                    onChange={setClearExistingImages}
+                                />
+                                
+                                <Button 
+                                    onClick={analyzeMatching}
+                                    disabled={isUploading}
+                                    size="large"
+                                    tone="success"
+                                >
+                                    {isUploading ? 'Uploading...' : 'Upload All Matched Images'}
+                                </Button>
+                            </div>
+                            
+                            {/* Görsel seçimi kaldırıldı - otomatik eşleşen tüm görseller yüklenecek */}
+                        </div>
+                    </Card>
+                </Layout.Section>
+
+                {/* Products shortcut moved above search */}
+                <Layout.Section>
+                    <Card>
+                        <div style={{ padding: '0.75rem', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                            <Text as="h3" variant="headingMd" fontWeight="bold">
+                                Products
+                            </Text>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+                                <Text as="span" variant="bodySm" tone="subdued">
+                                    {products.length > 0 ? `${products.length} products available` : 'View products list'}
+                                </Text>
+                                <Button onClick={() => window.location.assign('/products')}>
+                                    View Products
+                                </Button>
+                            </div>
+                        </div>
+                    </Card>
+                </Layout.Section>
+
+                {/* Search & Filter Section */}
+                <Layout.Section>
+                    <Card>
+                        <div style={{ padding: '0.75rem' }}>
+                            <Text as="h3" variant="headingMd" fontWeight="bold">
+                                Search & Filter Section
+                            </Text>
+                            <div style={{ 
+                                display: 'grid', 
+                                gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', 
+                                gap: '0.75rem', 
+                                marginTop: '0.75rem' 
+                            }}>
+                                <TextField
+                                    label="Search Files"
+                                    value={fileSearchTerm}
+                                    onChange={setFileSearchTerm}
+                                    placeholder="Search in file names..."
+                                    autoComplete="off"
+                                />
+                                
+                                <div style={{ display: 'flex', alignItems: 'end' }}>
+                                    <Checkbox
+                                        label="Show only matching files"
+                                        checked={showOnlyMatchingFiles}
+                                        onChange={setShowOnlyMatchingFiles}
+                                    />
+                                </div>
+                            </div>
+                        </div>
+                    </Card>
+                </Layout.Section>
+
+                {/* Google Drive Files */}
+                <Layout.Section>
+                    <Card>
+                        <div style={{ padding: '0.5rem' }}>
+                            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '0.5rem' }}>
+                                <Text as="h3" variant="headingMd" fontWeight="bold">
+                                    Google Drive Files ({getVisibleFilteredFiles().length})
+                                </Text>
+                                <div style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
+                                    <Button onClick={() => { resetPagination(); loadFiles(1); }} disabled={isLoading} size="micro">
+                                        Refresh
+                                    </Button>
+                                    <div style={{ display: 'flex', gap: '0.25rem', alignItems: 'center' }}>
+                                        <Button size="micro" disabled={isLoading || currentPage === 1} onClick={() => loadFiles(currentPage - 1)}>
+                                            Prev
+                                        </Button>
+                                        <Text as="span" variant="bodySm" tone="subdued">Page {currentPage}</Text>
+                                        <Button size="micro" disabled={isLoading || !hasMore} onClick={() => loadFiles(currentPage + 1)}>
+                                            Next
+                                        </Button>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            {isLoading ? (
+                                <div style={{ textAlign: 'center', padding: '1rem' }}>
+                                    <Text as="p" variant="bodyMd">Loading files...</Text>
+                                </div>
+                            ) : files.length === 0 ? (
+                                <div style={{ textAlign: 'center', padding: '1rem' }}>
+                                    <Text as="p" variant="bodyMd">No files uploaded yet</Text>
+                                </div>
+                            ) : (
+                                <div style={{ 
+                                    display: 'grid', 
+                                    gridTemplateColumns: 'repeat(auto-fill, minmax(110px, 1fr))', 
+                                    gap: '0.5rem' 
+                                }}>
+                                    {getVisibleFilteredFiles().map((file) => (
+                                        <div
+                                            key={file.id}
+                                            style={{
+                                                border: '1px solid #e1e3e5',
+                                                borderRadius: '6px',
+                                                padding: '0.375rem',
+                                                backgroundColor: 'white',
+                                                transition: 'all 0.2s ease'
+                                            }}
+                                        >
+                                            <div style={{ textAlign: 'center' }}>
+                                                <div style={{ marginBottom: '0.375rem' }}>
+                                                    <img
+                                                        src={file.thumbnail || '/placeholder-image.png'}
+                                                        alt={file.name}
+                                                        style={{
+                                                            width: '100%',
+                                                            height: '80px',
+                                                            objectFit: 'cover',
+                                                            borderRadius: '4px'
+                                                        }}
+                                                        loading="lazy"
+                                                        onError={(e) => {
+                                                            e.currentTarget.src = '/placeholder-image.png';
+                                                        }}
+                                                    />
+                                                </div>
+                                                <div style={{ 
+                                                    wordBreak: 'break-word',
+                                                    fontSize: '10px',
+                                                    lineHeight: '1.1',
+                                                    marginBottom: '0.125rem'
+                                                }}>
+                                                    <Text as="p" variant="bodySm" fontWeight="bold">
+                                                        {file.name}
+                                                    </Text>
+                                                </div>
+                                                
+                                                {/* Match Status Icon */}
+                                                <div style={{ 
+                                                    marginTop: '0.125rem',
+                                                    display: 'flex',
+                                                    justifyContent: 'center',
+                                                    alignItems: 'center',
+                                                    fontSize: '14px'
+                                                }}>
+                                                    {checkFileMatch(file) ? (
+                                                        <div style={{ 
+                                                            color: '#00a047', 
+                                                            display: 'flex', 
+                                                            alignItems: 'center', 
+                                                            gap: '0.25rem' 
+                                                        }}>
+                                                            <span>✅</span>
+                                                            <Text as="span" variant="bodySm" tone="success">
+                                                                Matched
+                                                            </Text>
+                                                        </div>
+                                                    ) : (
+                                                        <div style={{ 
+                                                            color: '#d72c0d', 
+                                                            display: 'flex', 
+                                                            alignItems: 'center', 
+                                                            gap: '0.25rem' 
+                                                        }}>
+                                                            <span>❌</span>
+                                                            <Text as="span" variant="bodySm" tone="critical">
+                                                                Not Matched
+                                                            </Text>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    </Card>
+                </Layout.Section>
+
+                
+
+
+            </Layout>
+        </Page>
+    );
+} 
